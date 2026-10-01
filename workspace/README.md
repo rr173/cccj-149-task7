@@ -443,3 +443,66 @@ tests/              274 个测试（归一化/规则、去重、不可变、合�
                      信号指标/引擎/复演/撤销重计/差异/处置乐观锁/分片崩溃/
                      计算键并发幂等/信号 HTTP 接口）
 ```
+
+---
+
+# 监管问询答复编排器（inquiry_reply，独立模块）
+
+接收监管方的问题清单、截止时间与可引用资料范围，把病例、已发送报文、
+适用法规与统计结论的**精确版本**锁定成答复底稿，组织多人协作撰写、
+定稿校验、可恢复发送、回执登记与更正管理。**纯 Python 标准库实现**
+（Python 3.11+，SQLite），独立数据库文件，不依赖 pv_service。
+
+## 需求映射
+
+| 需求 | 实现 |
+|---|---|
+| 问询登记（问题清单/截止时间/可引用资料范围） | `register_inquiry`：`idempotency_key` 唯一约束去重重复登记；范围支持精确 id 与 `前缀*` |
+| 精确版本锁定成答复底稿 | `lock_draft`：冻结每条引用的 `(evidence_id, version, content_hash)`；`evidence_versions` 只增（触发器），旧版本永远可取回 |
+| 组稿期间引用变化不悄悄混入，形成带原因的新底稿候选 | 底稿锁定内容不可改（`trg_drafts_guard` 触发器兜底）；`query_conflicts` 报告漂移；`refresh_draft` 生成 `REFRESH` 候选并写入 `EVIDENCE_UPDATED/EVIDENCE_MISSING` 原因，旧底稿置 `SUPERSEDED` 原样保留 |
+| 资料缺失/引用越权/版本矛盾阻止定稿并列出未满足项 | `validate_draft`：`MISSING_EVIDENCE / SCOPE_VIOLATION / VERSION_CONFLICT / UNLOCKED_CITATION / STALE_CITATION / EVIDENCE_TAMPERED` 等硬性问题全部落入 `issues`，`finalize_and_send` 以 `VALIDATION_FAILED` 拒绝并附报告 |
+| 多人分章节协作，过期提交不得覆盖新内容 | `submit_section`/`put_attachment` 乐观修订号：`base_revision` 必须等于调用方看到的当前修订号，否则 409 `STALE_REVISION`（附当前号）；不同章节可并行 |
+| 定稿校验：问题唯一可追踪、附件一致、敏感字段合规 | 每问题恰一个非空回答章节（`QUESTION_UNANSWERED/AMBIGUOUS/EMPTY_ANSWER/UNKNOWN_QUESTION`）；正文 `[[att:id]]` 与附件双向一致（`ATTACHMENT_MISSING/UNREFERENCED`）；`policy.py` 按收件辖区扫描敏感字段（命中值脱敏留痕） |
+| 不可变提交件，后续改动只能产生更正件，保留原件与回执 | `submissions` 触发器只允许 status 推进，payload/外发编号永不改写；`create_correction` 产生 `CORRECTION` 底稿 → 新提交件关联 `corrects_submission_id`；`correction_chain` 还原整条更正链（含各件回执） |
+| 可恢复作业，中断后续跑，重复请求/双节点不产生重复 | `jobs.job_key` 唯一（同一答复键一个作业）；步骤效果+履历+检查点同事务提交；租约原子领取（单条 UPDATE）；外发编号在 finalize 事务内由序列表分配；`retry_job`/`run_pending_jobs` 断点续跑 |
+| 回执登记 | `register_receipt`：`(submission_id, regulator_ref)` 唯一幂等 |
+| 独立核对 | `independent_check`：不信服务侧标志位，重算 payload 哈希、重跑问题/附件/引用/披露校验、核对作业履历与审计留痕，篡改可检出 |
+| 操作留痕 | `audit_log` 只增（触发器兜底），`audit_trail` 按实体过滤查询 |
+
+## 生命周期
+
+```
+register_inquiry ──> lock_draft ──> submit_section/put_attachment（多人并行）
+                          │                ▲
+        资料变化 ──> query_conflicts ──> refresh_draft（带原因新候选，旧底稿作废保留）
+                          ▼
+                   validate_draft（未满足项清单）──> finalize_and_send
+                          │                        （validate→finalize→send 可恢复作业）
+                          ▼
+                   submissions（不可变）──> register_receipt（监管回执）
+                          │
+                   create_correction ──> 更正底稿 ──> 更正件（关联原件）
+                          ▼
+                   independent_check（独立核对）/ audit_trail（操作留痕）
+```
+
+## 运行
+
+```bash
+python3 -m inquiry_reply                 # 端到端演示（临时库）
+python3 -m unittest tests.test_inquiry_reply -v   # 35 个测试
+```
+
+## 模块
+
+```
+inquiry_reply/
+  db.py         表结构、不可变触发器（底稿锁定/提交件/回执/履历/留痕）、IMMEDIATE 事务
+  evidence.py   可引用资料库：病例/报文/法规/统计的只增版本化存储
+  policy.py     收件辖区披露策略（敏感字段规则，可注册覆盖）
+  transport.py  外发通道契约（outbound_no 幂等）；默认本地发件箱
+  service.py    编排器：登记/锁定/协作/冲突/校验/作业/回执/更正/核对/留痕
+  __main__.py   端到端演示
+tests/test_inquiry_reply.py   35 个测试（锁定/漂移候选/阻止定稿/乐观并发/
+                                作业恢复/双节点幂等/回执/更正/独立核对/留痕）
+```
